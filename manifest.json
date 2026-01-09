@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "Group Tabs By Domain",
+  "version": "1.0",
+  "description": "Automatically groups tabs by their domain.",
+  "permissions": ["tabs", "tabGroups"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Group Tabs By Domain"
+  }
+}
