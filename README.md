@@ -21,3 +21,17 @@ The extension runs in the background and listens for tab creation and updates. W
 1. Open Chrome and navigate to `chrome://extensions/`.
 2. Enable "Developer mode" in the top right corner.
 3. Click "Load unpacked" and select the extension directory.
+
+## Note on Duplicate Saved Tab Groups
+
+While using this extension, you may occasionally notice **duplicate entries** for Saved Tab Groups (e.g., seeing two separate "BILIBILI" groups in your saved bar).
+
+**The Phenomenon**
+If you have a Saved Tab Group (e.g., "BILIBILI") that is currently **closed** (hidden from the tab strip and stored only in the bookmarks bar), opening a new Bilibili tab will cause the extension to create a **brand new** "BILIBILI" group, rather than restoring the previously closed one.
+
+**Why this happens (Technical Limitation)**
+This behavior is due to limitations in the current Chrome Extension API (`chrome.tabGroups`):
+
+1.  **Cannot access closed groups:** Chrome's API currently only allows extensions to query groups that are **active** (visible on the tab strip).
+2.  **Hidden groups are invisible:** Once a Saved Group is "closed" or "hidden," it becomes undetectable to the extension within the current session.
+3.  **The Result:** Since the extension cannot "see" that a "BILIBILI" group already exists in your background storage, it assumes none exists and creates a new one to ensure your tab is properly grouped.
