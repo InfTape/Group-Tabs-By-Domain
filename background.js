@@ -42,6 +42,8 @@ function isSkippableUrl(url) {
   );
 }
 
+let initialGroupingInProgress = false;
+
 // Collapse all groups in a window except keepGroupId, and expand keepGroupId.
 async function collapseOthersExpandCurrent(windowId, keepGroupId) {
   const allGroups = await chrome.tabGroups.query({ windowId });
@@ -58,40 +60,64 @@ async function collapseOthersExpandCurrent(windowId, keepGroupId) {
   await Promise.allSettled(jobs);
 }
 
-async function ensureGroupForDomain(windowId, domain, color) {
-  // Try to find existing group by exact title in same window
-  const groups = await chrome.tabGroups.query({ windowId, title: domain });
-  if (groups.length > 0) return groups[0].id;
+// Consolidate duplicate groups in the given window
+async function consolidateGroups(windowId) {
+  const groups = await chrome.tabGroups.query({ windowId });
+  const map = new Map();
 
-  // Create empty group by grouping a tab later; but chrome.tabs.group needs tabIds.
-  // So: caller will create group with tabIds and then update title.
-  return null;
+  // Group groups by title
+  for (const g of groups) {
+    if (!g.title) continue;
+    if (!map.has(g.title)) {
+      map.set(g.title, []);
+    }
+    map.get(g.title).push(g);
+  }
+
+  // Merge duplicates
+  for (const [title, groupList] of map) {
+    if (groupList.length > 1) {
+      console.log(`[GTBD] Consolidating ${groupList.length} groups for '${title}' in window ${windowId}`);
+      // Keep the first one, move others' tabs to it
+      const targetGroup = groupList[0];
+      const others = groupList.slice(1);
+      
+      for (const otherGroup of others) {
+          try {
+            const tabs = await chrome.tabs.query({ groupId: otherGroup.id });
+            const tabIds = tabs.map(t => t.id);
+            if (tabIds.length > 0) {
+              await chrome.tabs.group({ groupId: targetGroup.id, tabIds });
+            }
+          } catch (e) {
+            console.error("Error moving tabs during consolidation", e);
+          }
+      }
+    }
+  }
 }
 
-
-const groupCreationLocks = new Map();
-
-async function groupTab(tab) {
+async function groupTab(tab, options = {}) {
   let domain;
+  const { groupsCache } = options;
 
   // Handle "New Tab" specifically
   if (tab.url === "chrome://newtab/" || tab.url === "edge://newtab/") {
-    domain = "tab";
+    domain = "TAB";
   } else {
     if (!tab || isSkippableUrl(tab.url)) return;
     domain = getDomain(tab.url);
   }
 
   if (!domain) return;
-  
+
   const windowId = tab.windowId;
 
-  // Optimization: Check if tab is already in the correct group
+  // Check if tab is already in the correct group
   if (tab.groupId && tab.groupId !== chrome.tabGroups.TAB_GROUP_ID_NONE) {
     try {
       const group = await chrome.tabGroups.get(tab.groupId);
       if (group.title === domain) {
-        // Tab is already in the correct group. Just ensure ordering and return.
         await collapseOthersExpandCurrent(windowId, tab.groupId);
         return;
       }
@@ -102,62 +128,60 @@ async function groupTab(tab) {
 
   console.log(`[GTBD] Processing tab ${tab.id} ${tab.url}`);
 
-  const lockKey = `${windowId}:${domain}`;
-  
-  // Chain promises to ensure sequential processing for same domain
-  const previousPromise = groupCreationLocks.get(lockKey) || Promise.resolve();
-  
-  const currentPromise = previousPromise.then(async () => {
-    try {
-      // Find existing group in same window
-      const groups = await chrome.tabGroups.query({ title: domain, windowId });
+  try {
+    // Query groups in this window unless a cache was provided
+    const allGroups = groupsCache || await chrome.tabGroups.query({ windowId });
+    const existingGroup = allGroups.find(g => g.title === domain);
 
-      let groupId;
-      if (groups.length > 0) {
-        groupId = groups[0].id;
+    let groupId;
+    if (existingGroup) {
+      // Add to existing group in the same window
+      groupId = existingGroup.id;
 
-        // Add to existing group
-        await chrome.tabs.group({
-          groupId,
-          tabIds: [tab.id],
-        });
-      } else {
-        // Create new group with this tab
-        groupId = await chrome.tabs.group({ tabIds: [tab.id] });
-        // Auto-collapse new groups
-        await chrome.tabGroups.update(groupId, { title: domain, collapsed: true });
-      }
+      await chrome.tabs.group({
+        groupId,
+        tabIds: [tab.id],
+      });
 
-      // Only expand current domain group, collapse others (same window)
+      // Collapse/expand in the group's window
       await collapseOthersExpandCurrent(windowId, groupId);
-    } catch (err) {
-      console.error('Error in grouped logic:', err);
+    } else {
+      // Only create new group if no existing group with same name in this window
+      groupId = await chrome.tabs.group({ tabIds: [tab.id] });
+      await chrome.tabGroups.update(groupId, { title: domain, collapsed: true });
+      if (groupsCache) {
+        try {
+          const newGroup = await chrome.tabGroups.get(groupId);
+          groupsCache.push(newGroup);
+        } catch (e) {
+          console.error("Error updating groups cache", e);
+        }
+      }
+      await collapseOthersExpandCurrent(windowId, groupId);
     }
-  });
-
-  // store the new promise
-  groupCreationLocks.set(lockKey, currentPromise);
-
-  // cleanup after myself if I'm the last one (optional, but good for memory)
-  // relying on the Map to not grow indefinitely for unique domains is probably fine for now
-  // but let's clear it when chain is done to avoid memory leaks over long sessions
-  currentPromise.finally(() => {
-    if (groupCreationLocks.get(lockKey) === currentPromise) {
-      groupCreationLocks.delete(lockKey);
-    }
-  });
-
-  await currentPromise;
+  } catch (err) {
+    console.error("Error in groupTab:", err);
+  }
 }
 
 // Initial grouping: group all existing tabs (e.g., on install/startup)
 async function groupAllTabsInAllWindows() {
-  const windows = await chrome.windows.getAll({ populate: true });
-  for (const w of windows) {
-    for (const tab of w.tabs || []) {
-      // Skip pinned tabs if you want; currently it groups pinned too.
-      await groupTab(tab);
+  if (initialGroupingInProgress) return;
+  initialGroupingInProgress = true;
+  try {
+    const windows = await chrome.windows.getAll({ populate: true });
+    for (const w of windows) {
+      // First, consolidate any mess
+      await consolidateGroups(w.id);
+
+      const windowGroups = await chrome.tabGroups.query({ windowId: w.id });
+      for (const tab of w.tabs || []) {
+        // Skip pinned tabs if you want; currently it groups pinned too.
+        await groupTab(tab, { groupsCache: windowGroups });
+      }
     }
+  } finally {
+    initialGroupingInProgress = false;
   }
 }
 
@@ -175,6 +199,7 @@ chrome.runtime.onStartup.addListener(() => {
 
 // When a tab is created, URL might be empty or newtab; we rely on onUpdated(url) mainly.
 chrome.tabs.onCreated.addListener((tab) => {
+  if (initialGroupingInProgress) return;
   // Check if we should group this tab.
   // We pass it to groupTab which now handles the logic, but we need to ensure we call it.
   // Previously we checked isSkippableUrl here too.
@@ -185,6 +210,7 @@ chrome.tabs.onCreated.addListener((tab) => {
 
 // Key: regroup when URL changes (more reliable than only status=complete)
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (initialGroupingInProgress) return;
   // If the URL changed, we can act immediately
   if (changeInfo.url) {
     groupTab({ ...tab, url: changeInfo.url }).catch(console.error);
@@ -204,11 +230,14 @@ chrome.tabs.onActivated.addListener(async ({ tabId, windowId }) => {
     // If it's grouped, use that group; else ignore
     if (tab.groupId && tab.groupId !== chrome.tabGroups.TAB_GROUP_ID_NONE) {
       await collapseOthersExpandCurrent(windowId, tab.groupId);
-    } else if (tab.url && !isSkippableUrl(tab.url)) {
-      // If ungrouped but has a normal URL, group it (optional behavior)
-      await groupTab(tab);
     }
   } catch (e) {
     console.error(e);
   }
 });
+
+
+
+
+
+
