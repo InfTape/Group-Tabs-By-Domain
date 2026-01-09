@@ -1,12 +1,34 @@
-// Helper to extract domain from URL
+// Helper to extract group name from URL (remove www, TLD, uppercase)
 function getDomain(url) {
   try {
-    const u = new URL(url);
-    return u.hostname;
-  } catch (e) {
+    const { hostname } = new URL(url);
+
+    // split hostname
+    const parts = hostname
+      .toLowerCase()
+      .split(".")
+      .filter(p => p !== "www");
+
+    if (parts.length === 0) return null;
+
+    // Common meaningless top-level domains
+    const meaninglessTLD = new Set([
+      "com", "net", "org", "cn", "io", "co", "edu", "gov"
+    ]);
+
+    // Find the first "informative" field from left to right
+    for (const part of parts) {
+      if (!meaninglessTLD.has(part)) {
+        return part.toUpperCase();
+      }
+    }
+
+    return null;
+  } catch {
     return null;
   }
 }
+
 
 function isSkippableUrl(url) {
   if (!url) return true;
